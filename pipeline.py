@@ -1,4 +1,6 @@
 from pathlib import Path
+from pipeline_state import (documentation_dir, is_managed_documentation, collection_paths, collection_walk,
+                            collection_directory, load_status, create_status)
 import hashlib
 from datetime import datetime
 from lxml import etree as LET
@@ -16,7 +18,26 @@ import re
 import json
 import time
 import tempfile
+import stat
+import signal
 from copy import deepcopy
+
+# ==========================
+# DOCUMENTATION DESTINATIONS
+# ==========================
+
+def new_document(output, filename, accession_number):
+    """Reserve a fresh name without replacing existing reports or logs."""
+    destination = documentation_dir(output, accession_number) / filename
+    while True:
+        try:
+            with destination.open("x", encoding="utf-8"):
+                pass
+            return destination
+        except FileExistsError:
+            name = Path(filename)
+            destination = destination.parent / f"{name.stem}_{uuid.uuid4().hex}{name.suffix}"
+
 
 # ==========================
 # OPTIONAL DEPENDENCIES
@@ -177,9 +198,9 @@ def run_antivirus_scan(data_directory, output_folder, accession_number, result_c
     Optional result_callback receives this attempt's counts/outcome and only
     successfully written report paths; the existing return tuple is unchanged.
     """
-    data_directory = Path(data_directory)
+    data_directory = Path(data_directory).resolve()
     output_folder = Path(output_folder)
-    all_files = {p for p in data_directory.rglob("*") if p.is_file()}
+    all_files = {p for p in collection_paths(data_directory) if p.is_file()}
     defender_path = DEFENDER_PATH
     if not AV_AVAILABLE or defender_path is None:
         if defender_path is None:
@@ -272,8 +293,8 @@ def run_antivirus_scan(data_directory, output_folder, accession_number, result_c
         f"Files flagged: {len(infected_files)}\nScan errors: {counts['SCAN_ERROR']}\n"
         f"Google-native placeholders skipped: {counts['SKIPPED_CLOUD_NATIVE']}\n\n"
     )
-    av_csv_file = output_folder / f"antivirus_{accession_number}.csv"
-    av_log_file = output_folder / f"antivirus_{accession_number}.log"
+    av_csv_file = new_document(output_folder, f"antivirus_{accession_number}.csv", accession_number)
+    av_log_file = new_document(output_folder, f"antivirus_{accession_number}.log", accession_number)
     written_outputs = {}
     try:
         output_folder.mkdir(parents=True, exist_ok=True)
@@ -376,6 +397,14 @@ def configure_fits(fits_home=None):
         return None
 
 
+def _read_fits_report(report):
+    """Read complete FITS XML with the same validation in every execution path."""
+    root = LET.parse(str(report), LET.XMLParser(resolve_entities=False, no_network=True)).getroot()
+    if root.tag != f"{{{FITS_NS}}}fits":
+        raise ValueError("FITS returned an unexpected XML root")
+    return root
+
+
 def identify_with_fits(file_path, fits_home, java=None):
     """Run FITS with the Pipeline DROID-only profile; return its complete XML."""
     if not FITS_PROFILE.is_file():
@@ -396,10 +425,314 @@ def identify_with_fits(file_path, fits_home, java=None):
             capture_output=True, text=True, errors="replace", timeout=300,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        root = LET.parse(str(report), LET.XMLParser(resolve_entities=False, no_network=True)).getroot()
-        if root.tag != f"{{{FITS_NS}}}fits":
-            raise ValueError("FITS returned an unexpected XML root")
-        return root
+        return _read_fits_report(report)
+
+
+class FitsInputChangedError(RuntimeError):
+    """Identification inputs changed; the saved inventory must not be replaced."""
+
+
+def _fits_windows_times(handle, access_ns=None):
+    """Read Windows change time, or set access time without touching write time."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    if access_ns is not None:
+        ticks = access_ns // 100 + 116444736000000000
+        access = wintypes.FILETIME(ticks & 0xffffffff, ticks >> 32)
+        function = kernel.SetFileTime
+        function.argtypes = [wintypes.HANDLE, ctypes.c_void_p,
+                             ctypes.POINTER(wintypes.FILETIME), ctypes.c_void_p]
+        if not function(handle, None, ctypes.byref(access), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return
+
+    class BasicInfo(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_longlong) for name in
+                    ("creation", "access", "write", "change")] + [("attributes", wintypes.DWORD)]
+
+    info = BasicInfo()
+    function = kernel.GetFileInformationByHandleEx
+    function.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    if not function(handle, 0, ctypes.byref(info), ctypes.sizeof(info)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return info.change
+
+
+def _fits_file_state(path):
+    """Ignore read-induced access time; include identity and metadata change time."""
+    with open(path, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        change = info.st_ctime_ns
+        if os.name == "nt":
+            import msvcrt
+            change = _fits_windows_times(msvcrt.get_osfhandle(stream.fileno()))
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, change)
+
+
+def _fits_restore_access(path, access_ns, expected):
+    """Restore access time on the same file, leaving modification time alone."""
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        create = kernel.CreateFileW
+        create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                           ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        create.restype = wintypes.HANDLE
+        close = kernel.CloseHandle
+        close.argtypes = [wintypes.HANDLE]
+        # FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES; share read/write/delete.
+        handle = create(str(path), 0x180, 7, None, 3, 0x00200000, None)
+        if handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if _fits_file_state(path) != expected or _fits_windows_times(handle) != expected[4]:
+                raise FitsInputChangedError(f"File changed before timestamp restoration: {path}")
+            _fits_windows_times(handle, access_ns)
+        finally:
+            close(handle)
+    else:
+        with open(path, "rb") as stream:
+            if _fits_file_state(path) != expected:
+                raise FitsInputChangedError(f"File changed before timestamp restoration: {path}")
+            # POSIX UTIME_OMIT avoids overwriting an external modification time.
+            import ctypes
+            import sys
+            class Timespec(ctypes.Structure):
+                _fields_ = [("seconds", ctypes.c_long), ("nanoseconds", ctypes.c_long)]
+            times = (Timespec * 2)()
+            times[0].seconds, times[0].nanoseconds = divmod(access_ns, 1000000000)
+            times[1].nanoseconds = -2 if sys.platform == "darwin" else (1 << 30) - 2
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.futimens(stream.fileno(), times) != 0:
+                code = ctypes.get_errno()
+                raise OSError(code, os.strerror(code), str(path))
+
+
+class _FitsInputGuard:
+    def __init__(self, root, xml_path, xml_bytes, xml_state, records):
+        self.root, self.xml_path = root, xml_path
+        self.xml_bytes, self.xml_state = xml_bytes, xml_state
+        self.records = records
+        self.by_path = {r["path"]: r for r in records if r["error"] is None}
+        self.aliases = {}
+        for record in records:
+            if record["error"] is None:
+                self.aliases.setdefault(record["state"][:2], []).append(record)
+        self.touched = set()
+        self.changed = set()
+        self.directories = None
+
+    def check(self):
+        try:
+            xml_unchanged = (_fits_file_state(self.xml_path) == self.xml_state
+                             and self.xml_path.read_bytes() == self.xml_bytes)
+        except OSError:
+            xml_unchanged = False
+        if not xml_unchanged:
+            raise FitsInputChangedError("Accession XML changed during FITS; saved XML retained.")
+        for record in self.records:
+            if record.get("missing") and record["path"].exists():
+                raise FitsInputChangedError(f"Missing accession file appeared during FITS: {record['path']}")
+            if "state" not in record:
+                continue
+            path = record["path"]
+            try:
+                unchanged = (record["source"].resolve() == path
+                             and _fits_file_state(path) == record["state"])
+            except OSError:
+                unchanged = False
+            if not unchanged or path in self.changed:
+                raise FitsInputChangedError(f"Accession file changed during FITS: {path}")
+        if self.directories is not None:
+            try:
+                members, directories = _fits_directory_inventory(self.root)
+            except (OSError, ValueError) as exc:
+                raise FitsInputChangedError("Payload changed during FITS.") from exc
+            if (members != {r["path"] for r in self.records}
+                    or directories != self.directories):
+                raise FitsInputChangedError("Payload membership changed during FITS; saved XML retained.")
+
+    def restore(self):
+        for path in list(self.touched):
+            record = self.by_path[path]
+            try:
+                if record["source"].resolve() != path or _fits_file_state(path) != record["state"]:
+                    self.changed.add(path)
+                    logging.warning("[FITS:INPUT_CHANGED] %s; timestamps left untouched.", path)
+                    continue
+                _fits_restore_access(path, record["atime"], record["state"])
+                after = _fits_file_state(path)
+                if after[:4] != record["state"][:4]:
+                    self.changed.add(path)
+                else:
+                    # An explicit access-time restoration can itself change ctime.
+                    # Update aliases too, since hard links share their timestamps.
+                    for alias in self.aliases[record["state"][:2]]:
+                        alias["state"] = after
+            except FitsInputChangedError:
+                self.changed.add(path)
+                logging.warning("[FITS:INPUT_CHANGED] %s; timestamps left untouched.", path)
+            except OSError as exc:
+                logging.warning("Could not restore timestamps after FITS for %s: %s", path, exc)
+            finally:
+                self.touched.discard(path)
+
+
+def _fits_directory_inventory(root):
+    """Enumerate without following links; reject uncertain directory-mode inputs."""
+    members, directories = set(), {}
+
+    def inspect(path):
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise ValueError(f"symlink or reparse point: {path}")
+        return info
+
+    def fail(error):
+        raise error
+
+    for directory, names, files in os.walk(root, followlinks=False, onerror=fail):
+        directory = Path(directory)
+        info = inspect(directory)
+        directories[directory] = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+        for name in names:
+            inspect(directory / name)
+        for name in files:
+            path = directory / name
+            if not stat.S_ISREG(inspect(path).st_mode):
+                raise ValueError(f"not a regular file: {path}")
+            members.add(path.resolve())
+    return members, directories
+
+
+def _fits_batch_eligibility(root, records):
+    if len(records) < 2:
+        return None, "fewer than two inventory files"
+    if any(r["error"] is not None for r in records):
+        return None, "inventory contains invalid or unavailable entries"
+    expected = {r["path"] for r in records}
+    if len(expected) != len(records):
+        return None, "duplicate inventory paths"
+    try:
+        members, directories = _fits_directory_inventory(root)
+    except (OSError, ValueError) as exc:
+        return None, str(exc)
+    if members != expected:
+        return None, f"directory membership differs from inventory ({len(members)} disk files, {len(expected)} inventory files)"
+    return directories, None
+
+
+def _stop_fits_batch(process):
+    """Stop the launcher and its JVM before reading reports or restoring times."""
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            result = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True,
+                timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode and process.poll() is None:
+                raise RuntimeError("Could not terminate FITS process tree; accession XML retained.")
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        process.wait(timeout=15)
+    except (OSError, subprocess.SubprocessError) as exc:
+        # Never launch fallback work while an earlier JVM might still be alive.
+        raise RuntimeError("Could not confirm FITS process-tree termination; accession XML retained.") from exc
+
+
+def _identify_fits_batch(root, paths, fits_home, java, timeout, report_callback=None):
+    """Return validated reports; failed/missing entries are retried per file."""
+    home = Path(fits_home).resolve()
+    if not FITS_PROFILE.is_file():
+        raise FileNotFoundError(f"Pipeline FITS profile missing: {FITS_PROFILE}")
+    with tempfile.TemporaryDirectory(prefix="pipeline-fits-batch-") as temporary:
+        output = Path(temporary) / "reports"
+        output.mkdir()
+        expected = {output / (path.relative_to(root).as_posix() + ".fits.xml"): path for path in paths}
+        pending_reports = set(expected)
+
+        def poll_reports():
+            written = 0
+            for report, path in expected.items():
+                if not report.is_file():
+                    continue
+                written += 1
+                if report_callback is None or report not in pending_reports:
+                    continue
+                try:
+                    _read_fits_report(report)
+                except (OSError, LET.XMLSyntaxError, ValueError):
+                    continue  # FITS may still be writing this report.
+                pending_reports.remove(report)
+                report_callback(path)
+            return written
+        environment = os.environ.copy()
+        environment["FITS_HOME"] = str(home)
+        command = [java, "-classpath", str(home / "lib" / "*"), "edu.harvard.hul.ois.fits.Fits",
+                   "-f", str(FITS_PROFILE), "-i", str(root), "-o", str(output), "-r", "-n"]
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            options = dict(cwd=str(home), env=environment, shell=False, stdout=stdout, stderr=stderr,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if os.name != "nt":
+                options["start_new_session"] = True
+            process = subprocess.Popen(command, **options)
+            deadline = time.monotonic() + timeout
+            timed_out = False
+            finished = False
+            reported = 0
+            try:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        timed_out = True
+                        break
+                    try:
+                        process.wait(timeout=min(0.25, remaining))
+                        finished = True
+                        break
+                    except subprocess.TimeoutExpired:
+                        written = poll_reports()
+                        if written > reported:
+                            logging.info("[FITS:BATCH_PROGRESS] %d/%d reports written; awaiting batch completion.", written, len(paths))
+                            reported = written
+            finally:
+                # A single cleanup boundary covers deadlines, interruptions and
+                # unexpected exceptions. Successful waits need no termination.
+                if not finished:
+                    _stop_fits_batch(process)
+            if timed_out:
+                logging.warning("[FITS:BATCH_TIMEOUT] Budget of %.1f seconds exceeded; retrying unresolved files.", timeout)
+            if not timed_out and process.returncode:
+                stderr.seek(0, os.SEEK_END)
+                stderr.seek(max(0, stderr.tell() - 2000))
+                diagnostic = stderr.read(2000).decode("utf-8", errors="replace")
+                logging.warning("[FITS:BATCH_EXIT_ERROR] Exit code %s; retrying all files. %s", process.returncode, diagnostic)
+                return {}
+        actual = set(output.rglob("*"))
+        if any(p.is_symlink() or getattr(p.lstat(), "st_file_attributes", 0) & 0x400
+               or (not p.is_dir() and p not in expected) for p in actual):
+            logging.warning("[FITS:BATCH_INVALID_OUTPUT] Unexpected report paths; retrying all files.")
+            return {}
+        results = {}
+        for report, path in expected.items():
+            try:
+                # Re-read after termination; progress-time validation is not final.
+                results[path] = _read_fits_report(report)
+                if report_callback is not None and report in pending_reports:
+                    pending_reports.remove(report)
+                    report_callback(path)
+            except (OSError, LET.XMLSyntaxError, ValueError) as exc:
+                logging.warning("[FITS:BATCH_REPORT_ERROR] %s: %s; retrying per file.", path, exc)
+        return results
 
 
 def add_object_characteristics(premis_obj, checksum, size, fits_result=None):
@@ -456,21 +789,26 @@ def add_object_characteristics(premis_obj, checksum, size, fits_result=None):
 
 def generate_data_accessioner_xml(data_directory, output_folder, accession_number,
                                   move_files=False, clean_files_only=None, fits_home=None,
-                                  fits_workers=2, progress_callback=None):
-    """Compatibility entry point: ingest, then enrich the saved XML with FITS.
+                                  fits_workers=2, progress_callback=None, *, fits_batch=True,
+                                  fits_batch_timeout=None):
+    """Ingest, then enrich the saved XML with FITS.
 
     Use ingest_accession() for baseline-only ingest, and
     enrich_accession_with_fits() to identify an existing unbagged accession.
-    The legacy progress callback reports identification in inventory order.
+    The progress callback reports identification in inventory order.
     """
     if fits_workers not in (1, 2):
         raise ValueError("fits_workers must be 1 or 2")
+    if fits_batch_timeout is not None and (type(fits_batch_timeout) not in (int, float)
+            or not 0 < fits_batch_timeout < float("inf")):
+        raise ValueError("fits_batch_timeout must be a finite positive number")
     xml_path = ingest_accession(data_directory, output_folder, accession_number,
                                 move_files, clean_files_only)
     return enrich_accession_with_fits(
-        Path(output_folder) / accession_number, xml_path,
+        collection_directory(output_folder, accession_number), xml_path,
         fits_home=fits_home, fits_workers=fits_workers,
-        progress_callback=progress_callback,
+        progress_callback=progress_callback, fits_batch=fits_batch,
+        fits_batch_timeout=fits_batch_timeout,
     )
 
 
@@ -478,13 +816,29 @@ def ingest_accession(data_directory, output_folder, accession_number,
                      move_files=False, clean_files_only=None, progress_callback=None):
     """Transfer files and write the baseline inventory without configuring FITS.
 
-    Returns <output_folder>/<accession_number>.xml. UUIDs, sizes and SHA-256 digests are
+    Returns a new XML inventory in <output>/<accession>/<accession>_Docs/. UUIDs, sizes and SHA-256 digests are
     created here; enrich_accession_with_fits preserves them. This is a fresh
     ingest operation, not a resume/merge operation for an existing inventory.
     """
-    data_directory  = Path(data_directory)
+    data_directory  = Path(data_directory).resolve()
     output_folder   = Path(output_folder)
-    accession_folder = output_folder / accession_number
+    if clean_files_only is not None:
+        clean_files_only = {Path(path).resolve() for path in clean_files_only}
+    if not data_directory.is_dir():
+        raise ValueError("Ingest requires an existing source directory")
+    wrapper = collection_directory(output_folder, accession_number)
+    accession_folder = wrapper / data_directory.name
+    if accession_folder.is_relative_to(data_directory.resolve()) or data_directory.resolve().is_relative_to(accession_folder):
+        raise ValueError("Input Directory and accession directory must not contain one another.")
+    if wrapper.exists():
+        raise FileExistsError(f"Collection destination already exists; ingest will not overwrite it: {wrapper}")
+    try:
+        status = load_status(output_folder, accession_number)
+    except FileNotFoundError:
+        status = create_status(output_folder, accession_number, collection_name=data_directory.name, layout="unknown")
+    if status["collection_name"] != data_directory.name:
+        raise ValueError("Source collection name differs from the recorded accession collection")
+    documentation_dir(output_folder, accession_number)
     accession_folder.mkdir(parents=True, exist_ok=True)
 
     dir_times = {}
@@ -500,7 +854,7 @@ def ingest_accession(data_directory, output_folder, accession_number,
         f"Transferred on {datetime.now().isoformat()}"
     )
 
-    total_files = (sum(1 for p in data_directory.rglob("*")
+    total_files = (sum(1 for p in collection_paths(data_directory)
                        if p.is_file() and (clean_files_only is None or p in clean_files_only))
                    if progress_callback is not None else 0)
     completed = 0
@@ -515,7 +869,7 @@ def ingest_accession(data_directory, output_folder, accession_number,
     def finish_file(dest_path, rel_path, checksum):
         file_el = LET.SubElement(
             accession_el, "file",
-            name=str(rel_path.as_posix()),
+            name=(Path(data_directory.name) / rel_path).as_posix(),
             size=str(dest_path.stat().st_size),
             SHA256=checksum,
         )
@@ -534,13 +888,14 @@ def ingest_accession(data_directory, output_folder, accession_number,
         ).text = str(uuid.uuid4())
         add_object_characteristics(premis_obj, checksum, dest_path.stat().st_size)
 
-    for file_path in data_directory.rglob("*"):
+    for file_path in collection_paths(data_directory):
 
         # Record directory timestamps so we can restore them after copying
         if file_path.is_dir():
             stat = file_path.stat()
             rel  = file_path.relative_to(data_directory)
-            dir_times[rel] = (stat.st_atime, stat.st_mtime)
+            dir_times[rel] = (stat.st_atime_ns, stat.st_mtime_ns)
+            (accession_folder / rel).mkdir(parents=True, exist_ok=True)
 
         if not file_path.is_file():
             continue
@@ -558,6 +913,8 @@ def ingest_accession(data_directory, output_folder, accession_number,
         dest_path = accession_folder / rel_path
         dest_path.parent.mkdir(parents=True, exist_ok=True)
 
+        if os.path.lexists(dest_path):
+            raise FileExistsError(f"Refusing to replace an existing collection file: {dest_path}")
         if move_files:
             shutil.move(str(file_path), str(dest_path))
         else:
@@ -572,7 +929,7 @@ def ingest_accession(data_directory, output_folder, accession_number,
         finish_file(dest_path, rel_path, checksum)
         completed += 1
 
-    xml_output_file = output_folder / f"{accession_number}.xml"
+    xml_output_file = new_document(output_folder, f"{accession_number}.xml", accession_number)
     LET.ElementTree(collection_el).write(
         str(xml_output_file),
         encoding="UTF-8",
@@ -586,7 +943,7 @@ def ingest_accession(data_directory, output_folder, accession_number,
         dest_dir = accession_folder / rel_path
         if dest_dir.exists():
             try:
-                os.utime(dest_dir, (atime, mtime))
+                os.utime(dest_dir, ns=(atime, mtime))
             except Exception:
                 pass
 
@@ -594,7 +951,8 @@ def ingest_accession(data_directory, output_folder, accession_number,
 
 
 def enrich_accession_with_fits(accession_folder, xml_input, fits_home=None,
-                               fits_workers=2, progress_callback=None, result_callback=None):
+                               fits_workers=2, progress_callback=None, result_callback=None, *,
+                               fits_batch=True, fits_batch_timeout=None):
     """Enrich an existing inventory in place without transferring or hashing.
 
     accession_folder is the accession directory, optionally already bagged. Only files listed in XML
@@ -604,32 +962,72 @@ def enrich_accession_with_fits(accession_folder, xml_input, fits_home=None,
     Returns xml_input. Optional result_callback receives per-attempt counts and
     outcome; historical XML is never used to infer this attempt's success.
     Bagged accessions resolve logical inventory paths under data/.
+    Directory batching is enabled only for an exact inventory match. Set
+    fits_batch=False for the original per-file launcher. The default batch
+    timeout is 300 seconds per inventory file (no inactivity cutoff); callers
+    can supply a positive fits_batch_timeout in seconds. Final progress and
+    result counts include each file once, including per-file retries.
+    Inputs must remain quiescent: detected changes abort XML replacement.
     """
     if fits_workers not in (1, 2):
         raise ValueError("fits_workers must be 1 or 2")
+    if fits_batch_timeout is not None and (type(fits_batch_timeout) not in (int, float)
+            or not 0 < fits_batch_timeout < float("inf")):
+        raise ValueError("fits_batch_timeout must be a finite positive number")
     from pipeline_state import bag_layout, resolve_payload_root
     accession_folder = resolve_payload_root(accession_folder, bag_layout(accession_folder)).resolve()
     xml_input = Path(xml_input)
-    tree = LET.parse(str(xml_input), LET.XMLParser(resolve_entities=False, no_network=True))
+    xml_state = _fits_file_state(xml_input)
+    xml_bytes = xml_input.read_bytes()
+    if _fits_file_state(xml_input) != xml_state:
+        raise FitsInputChangedError("Accession XML changed while being read.")
+    tree = LET.ElementTree(LET.fromstring(xml_bytes, LET.XMLParser(resolve_entities=False, no_network=True)))
     files = tree.findall(".//{http://dataaccessioner.org/schema/dda-1-1}file")
+    records = []
+    for file_el in files:
+        source = accession_folder / (file_el.get("name") or "")
+        record = dict(file=file_el, source=source, path=source, error=None)
+        try:
+            path = source.resolve()
+            path.relative_to(accession_folder)
+            record["path"] = path
+            if not path.is_file():
+                record["missing"] = not path.exists()
+                raise FileNotFoundError(f"Accession file missing: {path}")
+            record["atime"] = path.stat().st_atime_ns
+            record["state"] = _fits_file_state(path)
+            if file_el.find(f"{{{PREMIS_NS}}}object/{{{PREMIS_NS}}}objectCharacteristics") is None:
+                raise ValueError("File record has no baseline PREMIS characteristics")
+        except (OSError, ValueError) as exc:
+            record["error"] = exc
+        records.append(record)
+    guard = _FitsInputGuard(accession_folder, xml_input, xml_bytes, xml_state, records)
     fits_config = configure_fits(fits_home)
     completed = 0
+    progressed = set()
     counts = dict(file_count=len(files), identified_count=0, unidentified_count=0,
                   error_count=0, unavailable_count=0)
 
-    def finish_file(file_el, dest_path, times, future):
+    def advance_progress(file_el):
         nonlocal completed
+        if id(file_el) in progressed:
+            return
+        progressed.add(id(file_el))
         completed += 1
         if progress_callback is not None:
             try:
                 progress_callback(completed, len(files), file_el.get("name"))
             except Exception:
                 logging.warning("Could not update accession progress.", exc_info=True)
-        if future is None:
+
+    def finish_file(file_el, dest_path, future, fits_result):
+        advance_progress(file_el)
+        if future is None and fits_result is None:
             counts["unavailable_count" if fits_config is None else "error_count"] += 1
             return
         try:
-            fits_result = future.result()
+            if fits_result is None:
+                fits_result = future.result()
         except subprocess.TimeoutExpired:
             counts["error_count"] += 1
             logging.warning("[FITS:TIMEOUT] %s exceeded 300 seconds; existing metadata retained.", dest_path)
@@ -647,12 +1045,6 @@ def enrich_accession_with_fits(accession_folder, xml_input, fits_home=None,
             counts["error_count"] += 1
             logging.warning("[FITS:EXECUTION_ERROR] %s: %s", dest_path, exc)
             return
-        finally:
-            try:
-                os.utime(dest_path, ns=times)
-            except OSError as exc:
-                logging.warning("Could not restore timestamps after FITS for %s: %s", dest_path, exc)
-
         characteristics = file_el.find(f"{{{PREMIS_NS}}}object/{{{PREMIS_NS}}}objectCharacteristics")
         _replace_fits_metadata(characteristics, fits_result)
         formats = characteristics.findall(f"{{{PREMIS_NS}}}format")
@@ -665,30 +1057,54 @@ def enrich_accession_with_fits(accession_folder, xml_input, fits_home=None,
             logging.info("[FITS:NO_IDENTIFICATION] %s; FITS completed but returned no useful "
                          "format identification. Raw FITS XML retained.", dest_path)
 
-    pending = deque()
-    with ThreadPoolExecutor(max_workers=fits_workers) as executor:
-        for file_el in files:
-            dest_path = accession_folder / (file_el.get("name") or "")
-            future = None
-            times = None
-            if fits_config:
+    batch_results = {}
+    try:
+        if fits_config and fits_batch:
+            directories, reason = _fits_batch_eligibility(accession_folder, records)
+            if reason is not None:
+                logging.info("[FITS:BATCH_INELIGIBLE] %s; using per-file identification for %d files.", reason, len(files))
+            else:
+                guard.directories = directories
+                guard.check()
+                timeout = fits_batch_timeout if fits_batch_timeout is not None else 300 * len(files)
+                logging.info("[FITS:BATCH_START] %d inventory files; timeout %.1f seconds; no inactivity cutoff.", len(files), timeout)
+                guard.touched.update(r["path"] for r in records)
+                ready = set()
+                def report_ready(path):
+                    ready.add(path)
+                    while completed < len(records) and records[completed]["path"] in ready:
+                        advance_progress(records[completed]["file"])
                 try:
-                    dest_path = dest_path.resolve()
-                    dest_path.relative_to(accession_folder)
-                    if not dest_path.is_file():
-                        raise FileNotFoundError(f"Accession file missing: {dest_path}")
-                    if file_el.find(f"{{{PREMIS_NS}}}object/{{{PREMIS_NS}}}objectCharacteristics") is None:
-                        raise ValueError("File record has no baseline PREMIS characteristics")
-                    stat = dest_path.stat()
-                    times = (stat.st_atime_ns, stat.st_mtime_ns)
-                    future = executor.submit(identify_with_fits, dest_path, *fits_config)
-                except (OSError, ValueError) as exc:
-                    logging.warning("[FITS:EXECUTION_ERROR] %s: %s", dest_path, exc)
-            pending.append((file_el, dest_path, times, future))
-            if len(pending) >= (fits_workers if fits_config else 1):
+                    batch_results = _identify_fits_batch(
+                        accession_folder, [r["path"] for r in records], *fits_config, timeout, report_ready)
+                except (OSError, subprocess.SubprocessError, LET.XMLSyntaxError, ValueError) as exc:
+                    logging.warning("[FITS:BATCH_ERROR] %s; retrying per file.", exc)
+                finally:
+                    guard.restore()
+                guard.check()
+                logging.info("[FITS:BATCH_RESULT] %d/%d valid reports; %d per-file retries.",
+                             len(batch_results), len(files), len(files) - len(batch_results))
+        elif fits_config:
+            logging.info("[FITS:BATCH_DISABLED] Using per-file identification for %d files.", len(files))
+
+        pending = deque()
+        with ThreadPoolExecutor(max_workers=fits_workers) as executor:
+            for record in records:
+                file_el, dest_path = record["file"], record["path"]
+                future = None
+                if fits_config:
+                    if record["error"] is not None:
+                        logging.warning("[FITS:EXECUTION_ERROR] %s: %s", dest_path, record["error"])
+                    elif dest_path not in batch_results:
+                        guard.touched.add(dest_path)
+                        future = executor.submit(identify_with_fits, dest_path, *fits_config)
+                pending.append((file_el, dest_path, future, batch_results.get(dest_path)))
+                if len(pending) >= (fits_workers if fits_config else 1):
+                    finish_file(*pending.popleft())
+            while pending:
                 finish_file(*pending.popleft())
-        while pending:
-            finish_file(*pending.popleft())
+    finally:
+        guard.restore()
 
     if fits_config:
         # Replace only after serialization succeeds, preserving the saved baseline
@@ -699,6 +1115,8 @@ def enrich_accession_with_fits(accession_folder, xml_input, fits_home=None,
                                              suffix=".tmp", delete=False) as stream:
                 temporary = Path(stream.name)
                 tree.write(stream, encoding="UTF-8", xml_declaration=True, pretty_print=True)
+            # Recheck after serialization too, before replacing any saved XML.
+            guard.check()
             os.replace(temporary, xml_input)
         finally:
             if temporary is not None and temporary.exists():
@@ -848,7 +1266,7 @@ def _bag_preflight(accession_folder, accession_number, contact_name, contact_ema
         if storage_option not in APTRUST_STORAGE_OPTIONS:
             raise ValueError(f"Invalid APTrust Storage-Option: {storage_option!r}")
 
-    entries = sorted(root.iterdir())
+    entries = sorted(entry for entry in root.iterdir() if not is_managed_documentation(entry))
     reserved = {"data", "bagit.txt", "bag-info.txt", "aptrust-info.txt", "fetch.txt"}
     for entry in entries:
         name = entry.name.casefold()
@@ -861,13 +1279,10 @@ def _bag_preflight(accession_folder, accession_number, contact_name, contact_ema
     payload = {}
     seen = set()
 
-    def walk_error(exc):
-        raise exc
-
     # Do not follow links/reparse directories: they could escape the accession
     # or change meaning when relocated. Reject names this manifest writer cannot
     # represent unambiguously rather than silently encoding a different path.
-    for directory, directories, filenames in os.walk(root, onerror=walk_error, followlinks=False):
+    for directory, directories, filenames in collection_walk(root):
         for name in sorted(directories + filenames):
             path = Path(directory) / name
             rel = path.relative_to(root).as_posix()
@@ -974,27 +1389,48 @@ def construct_bag(accession_folder, accession_number, contact_name="", contact_e
     return root
 
 
-def serialize_bag_to_tar(bag_path):
-    """Serialize an existing bag to a sibling <bag-name>.tar and return its Path.
+def serialize_bag_to_tar(bag_path, *, overwrite=False):
+    """Serialize a fresh, versioned collection and documentation snapshot.
 
-    Checks basic structure only, not checksums or APTrust compliance. Does not
+    The legacy overwrite argument is accepted for compatibility but never permits
+    replacement. Check basic structure, not checksums or APTrust compliance. Does not
     construct, validate, move payload or regenerate manifests. Failed writes or
-    replacement preserve a previous TAR; the bag must remain unchanged meanwhile.
+    publication preserve previous TARs; the bag must remain unchanged meanwhile.
     """
     root = Path(bag_path).resolve()
     if (not root.is_dir() or not (root / "data").is_dir()
             or not (root / "bagit.txt").is_file()
             or not any(p.is_file() for p in root.glob("manifest-*.txt"))):
         raise ValueError(f"Expected an existing BagIt directory: {root}")
-    tar_path = root.parent / (root.name + ".tar")
+    parent = root.parent
+    status = load_status(parent.parent, parent.name)
+    if collection_directory(parent.parent, parent.name) != root:
+        raise ValueError("TAR requires the accession collection wrapper")
+    docs = documentation_dir(parent.parent, parent.name)
+    tar_path = parent / (parent.name + ".tar")
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(dir=root.parent, prefix=tar_path.name + ".",
                                          suffix=".tmp", delete=False) as stream:
             temporary = Path(stream.name)
         with tarfile.open(temporary, "w") as archive:
-            archive.add(root, arcname=root.name)
-        os.replace(temporary, tar_path)
+            archive.add(root, arcname=f"{parent.name}/{root.name}")
+            archive.add(docs, arcname=f"{parent.name}/{docs.name}")
+        # Publish only a fully written archive. Hard-link creation is atomic and
+        # fails for any occupied name (including directories and dangling links).
+        # Never fall back to replacement on filesystems without hard-link support.
+        version = 1
+        while True:
+            tar_path = parent / (parent.name + (f"_v{version}" if version > 1 else "") + ".tar")
+            if os.path.lexists(tar_path):
+                version += 1
+                continue
+            try:
+                os.link(temporary, tar_path)
+                break
+            except FileExistsError:
+                version += 1
+        logging.info("Selected preservation package output: %s", tar_path)
     except Exception:
         logging.exception("TAR serialization failed for %s; previous deliverable retained.", root)
         raise
@@ -1013,7 +1449,7 @@ def create_bag(accession_folder, accession_number, contact_name="", contact_emai
                access="Institution", storage_option="Standard",
                description="", serialize_tar=False, validate=False,
                xml_manifest=None):
-    """Compatibility wrapper: construct, optionally validate, optionally serialize.
+    """Construct, optionally validate, and optionally serialize a collection bag.
 
     Return (bag_path, tar_path, bag_valid, bag_error); bag_valid is None if not
     requested. Requested validation failure blocks TAR creation. As before,
@@ -1046,7 +1482,7 @@ def validate_bag(bag_path, result_callback=None):
     Validate an existing BagIt bag directory.
     Returns (is_valid: bool, error_message: str).
     Optional result_callback distinguishes invalid findings from execution or
-    dependency errors without changing the legacy two-value return contract.
+    dependency errors without changing the two-value return contract.
     """
     if not BAGIT_AVAILABLE:
         if result_callback is not None:
@@ -1077,15 +1513,15 @@ def run_fixity(xml_input, output_folder, accession_number):
     """
     Verify algorithm-identified checksums recorded in the XML manifest against files on disk.
     Resolve logical inventory paths inside data/ for an existing BagIt package.
-    Writes a CSV report and log file to output_folder.
+    Writes CSV and LOG reports to <output>/<accession>/<accession>_Docs/.
     """
     output_folder    = Path(output_folder)
     from pipeline_state import bag_layout, resolve_payload_root
-    accession = output_folder / accession_number
+    accession = collection_directory(output_folder, accession_number)
     accession_folder = resolve_payload_root(accession, bag_layout(accession))
 
-    log_file = output_folder / f"fixity_{accession_number}.log"
-    csv_file = output_folder / f"fixity_{accession_number}.csv"
+    log_file = new_document(output_folder, f"fixity_{accession_number}.log", accession_number)
+    csv_file = new_document(output_folder, f"fixity_{accession_number}.csv", accession_number)
 
     # Use an isolated named logger so the pipeline's root logger is not disturbed
     fixity_log = logging.getLogger(f"fixity.{accession_number}")
@@ -1179,7 +1615,7 @@ def generate_summary_report(csv_file, output_folder, accession_number):
             if mime:
                 mime_counter[mime] += 1
 
-    output_txt = Path(output_folder) / f"{accession_number}.txt"
+    output_txt = new_document(output_folder, f"{accession_number}.txt", accession_number)
 
     with open(output_txt, "w", encoding="utf-8") as f:
         f.write(f"Accession: {accession_number}\n\n")

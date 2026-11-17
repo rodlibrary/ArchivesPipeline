@@ -14,6 +14,22 @@ import re
 import tempfile
 from lxml import etree as ET
 
+def document_path(output, accession, stage, key, filename, status=None):
+    """Resolve a current report, including its collision-safe recorded filename."""
+    root = Path(output).resolve()
+    docs = docs_path(root, accession)
+    if status is None:
+        try:
+            status = load_status(root, accession)
+        except FileNotFoundError:
+            status = None
+    value = status["steps"][stage]["outputs"].get(key) if status else None
+    path = root / value if isinstance(value, str) and value else docs / filename
+    if path.resolve().parent != docs.resolve() or path.is_symlink():
+        raise StatusValidationError("Documentation must be stored inside this accession's documentation directory")
+    return path
+
+
 XSLT_DIR = Path(__file__).resolve().parent / "resources" / "xslt"
 
 
@@ -42,20 +58,95 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def _status_path(output_folder, accession_number):
+def _safe_component(accession_number):
     # Apply Windows component rules even when read on another operating system.
     if (not isinstance(accession_number, str) or not accession_number
             or re.search(r'[<>:"/\\|?*\x00-\x1f\x7f]', accession_number)
             or accession_number != accession_number.strip()
-            or accession_number.endswith(".")
+            or accession_number in (".", "..") or accession_number.endswith((".", " "))
             or accession_number.split(".")[0].upper() in
             {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
              *(f"LPT{i}" for i in range(1, 10))}):
         raise StatusValidationError("Accession number must be a single safe path component")
+
+
+def _accession_root(output_folder, accession_number):
+    _safe_component(accession_number)
+    if ".." in accession_number:
+        raise StatusValidationError("Accession number must not contain traversal sequences")
     root = Path(output_folder).resolve()
-    path = root / f"{accession_number}_status.json"
-    if path.resolve().parent != root or (root / accession_number).resolve().parent != root:
+    accession = root / accession_number
+    if accession.resolve().parent != root or accession.is_symlink() or accession.is_junction():
         raise StatusValidationError("Accession path resolves outside the output directory")
+    return accession
+
+
+DOC_MARKER = ".archives-pipeline-doc"
+
+
+def is_managed_documentation(path):
+    path = Path(path)
+    marker = path / DOC_MARKER
+    return (path.name.casefold() == f"{path.parent.name}_Docs".casefold() and not path.is_symlink()
+            and not path.is_junction() and marker.is_file() and not marker.is_symlink())
+
+
+def docs_path(output_folder, accession_number):
+    """Read-only canonical documentation path with containment checks."""
+    accession = _accession_root(output_folder, accession_number)
+    docs = accession / f"{accession_number}_Docs"
+    if docs.is_symlink() or docs.is_junction() or docs.resolve().parent != accession.resolve():
+        raise StatusValidationError("Accession documentation must be a directory inside the accession directory")
+    return docs
+
+
+def documentation_dir(output_folder, accession_number):
+    docs = docs_path(output_folder, accession_number)
+    try:
+        load_status(output_folder, accession_number)
+    except FileNotFoundError:
+        pass
+    if docs.exists() and not is_managed_documentation(docs):
+        raise StatusValidationError(f"Unmanaged or unsupported output directory: {docs}. Original content was left unchanged.")
+    docs.mkdir(parents=True, exist_ok=True)
+    marker = docs / DOC_MARKER
+    if not marker.exists():
+        with marker.open("x", encoding="utf-8") as stream:
+            stream.write("Archives Pipeline documentation; excluded from collection payload.\n")
+    return docs
+
+
+def collection_directory(output, accession):
+    """The accession's fixed collection wrapper, independent of the source name."""
+    parent = _accession_root(output, accession)
+    path = parent / f"{accession}_Collection"
+    if path.resolve().parent != parent or path.is_symlink() or path.is_junction():
+        raise StatusValidationError("Collection path resolves outside the accession directory")
+    return path
+
+
+def collection_walk(root):
+    """Walk content, excluding only a marked top-level documentation directory."""
+    root = Path(root)
+    def walk_error(exc):
+        raise exc
+    for directory, directories, files in os.walk(root, followlinks=False, onerror=walk_error):
+        if Path(directory) == root:
+            directories[:] = [name for name in directories
+                              if not is_managed_documentation(root / name)]
+        yield directory, directories, files
+
+
+def collection_paths(root):
+    for directory, directories, files in collection_walk(root):
+        for name in directories + files:
+            yield Path(directory) / name
+
+
+def _status_path(output_folder, accession_number):
+    path = docs_path(output_folder, accession_number) / f"{accession_number}_status.json"
+    if path.is_symlink():
+        raise StatusValidationError("Status JSON must not be a symbolic link")
     return path
 
 
@@ -87,14 +178,17 @@ def _validate(status, accession_number):
         raise StatusValidationError("Status must be an object")
     version = status.get("schema_version")
     _integer(version, 1, "schema_version")
-    if version > 1:
+    if version > 2:
         raise UnsupportedSchemaError(f"Newer unsupported status schema: {version}")
-    required = {"revision", "accession_number", "accession_path", "created_at",
+    if version != 2:
+        raise UnsupportedSchemaError("Unsupported previous output structure; use a new accession directory. No migration is performed.")
+    required = {"collection_name", "revision", "accession_number", "accession_path", "created_at",
                 "updated_at", "layout", "steps"}
     if not required <= status.keys():
         raise StatusValidationError("Missing required status fields")
     if status["accession_number"] != accession_number or status["accession_path"] != accession_number:
         raise StatusValidationError("Embedded accession identity does not match requested accession")
+    _safe_component(status["collection_name"])
     _integer(status["revision"], 1, "revision")
     _timestamp(status["created_at"], "created_at")
     _timestamp(status["updated_at"], "updated_at")
@@ -154,17 +248,22 @@ def _write(path, status):
                 pass
 
 
-def create_status(output_folder, accession_number, *, layout="unbagged"):
+def create_status(output_folder, accession_number, *, layout="unbagged", collection_name=None):
     """Create a record with explicit layout; refuse to replace any existing file.
 
     Default remains unbagged for new managed accessions. A first managed run of
-    existing artifacts can supply unknown without inferring legacy layout.
+    existing artifacts can supply unknown without inferring execution history.
     """
     path = _status_path(output_folder, accession_number)
     if path.exists():
         raise FileExistsError(path)
+    parent = _accession_root(output_folder, accession_number)
+    if parent.exists() and any(not is_managed_documentation(entry) for entry in parent.iterdir()):
+        raise StatusValidationError("Existing accession contains unmanaged content or an unsupported previous output structure; choose a new output directory.")
+    collection_name = accession_number if collection_name is None else collection_name
+    _safe_component(collection_name)
     timestamp = _now()
-    status = dict(schema_version=1, revision=1, accession_number=accession_number,
+    status = dict(schema_version=2, collection_name=collection_name, revision=1, accession_number=accession_number,
                   accession_path=accession_number, created_at=timestamp,
                   updated_at=timestamp, layout=layout, steps={})
     for stage in STAGE_IDS:
@@ -174,7 +273,7 @@ def create_status(output_folder, accession_number, *, layout="unbagged"):
                                             method="none", reasons=[]),
             settings={}, inputs={}, outputs={}, evidence={}, result={})
     _validate(status, accession_number)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    documentation_dir(output_folder, accession_number)
     _write(path, status)
     return status
 
@@ -182,12 +281,19 @@ def create_status(output_folder, accession_number, *, layout="unbagged"):
 def load_status(output_folder, accession_number):
     """Load without creating or repairing anything; preserve unknown fields."""
     path = _status_path(output_folder, accession_number)
+    if path.exists() and not is_managed_documentation(path.parent):
+        raise StatusValidationError("Processing status is not inside managed accession documentation; original content was left unchanged")
+    if not path.exists() and path.parent.parent.exists():
+        entries = path.parent.parent.iterdir()
+        if any(not is_managed_documentation(entry) for entry in entries):
+            raise UnsupportedSchemaError("Accession has no current processing status and contains unmanaged or unsupported output. Original content was left unchanged.")
     try:
         with path.open(encoding="utf-8") as stream:
             status = json.load(stream)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise StatusValidationError(f"Malformed status JSON in {path}: {exc}") from exc
     _validate(status, accession_number)
+    collection_directory(output_folder, accession_number)
     return status
 
 
@@ -375,18 +481,9 @@ PREMIS = "info:lc/xmlns/premis-v2"
 FITS = "http://hul.harvard.edu/ois/xml/ns/fits/fits_output"
 
 
-# MD5 is used only to validate old evidence before upgrading it. New captures
-# always use SHA-256. Keep the original canonical structures for compatibility.
-LEGACY_METHODS = {name.replace("sha256", "md5"): name for name in (
-    "file-sha256-v1", "inventory-sha256-v1", "payload-stat-sha256-v1",
-    "bag-stat-sha256-v1", "fits-sha256-v1")}
-
-
 def _fingerprint_hasher(algorithm, data=b""):
     if algorithm == "sha256":
         return hashlib.sha256(data)
-    if algorithm == "md5":
-        return hashlib.md5(data, usedforsecurity=False)  # Historical evidence only.
     raise ValueError("unsupported_fingerprint_algorithm")
 
 
@@ -481,9 +578,7 @@ def resolve_payload_root(payload, layout):
 def _membership(root, include_dirs=False):
     result = []
     _no_link(root)
-    def walk_error(exc):
-        raise exc
-    for directory, directories, files in os.walk(root, followlinks=False, onerror=walk_error):
+    for directory, directories, files in collection_walk(root):
         for name in sorted(directories + files):
             path = Path(directory) / name
             _no_link(path)
@@ -520,22 +615,23 @@ def file_stat(path):
     return dict(size=stat.st_size, mtime_ns=stat.st_mtime_ns)
 
 
-def _specs(stage, status, accession, input_side, recording=False):
+def _specs(stage, status, accession, input_side, output):
     record = status["steps"][stage]
-    xml, payload = f"{accession}.xml", accession
+    xml = document_path(output, accession, "ingest", "xml", f"{accession}.xml", status).relative_to(output).as_posix()
+    payload = collection_directory(output, accession).relative_to(output).as_posix()
     def descriptor(method, path, reason, scope="output"):
         return dict(method=method, path=path, scope=scope, reason=reason)
     inventory = descriptor("inventory-sha256-v1", xml, "baseline_inventory_changed")
     logical = descriptor("payload-stat-sha256-v1", payload, "payload_changed")
     exact_xml = descriptor("file-sha256-v1", xml, "xml_changed")
-    bag = descriptor("bag-stat-sha256-v1", accession, "bag_changed")
+    bag = descriptor("bag-stat-sha256-v1", payload, "bag_changed")
     inputs = {
         "antivirus": {}, "ingest": {}, "fits": dict(inventory=inventory, payload=logical,
             profile=descriptor("file-sha256-v1", "fits/config/fits-droid.xml", "fits_profile_changed", "processing")),
         "reports": dict(xml=exact_xml, csv_stylesheet=descriptor("file-sha256-v1", "files.csv.xslt", "csv_stylesheet_changed", "stylesheets"),
                         html_stylesheet=descriptor("file-sha256-v1", "files.html.xslt", "html_stylesheet_changed", "stylesheets"),
                         payload=logical),
-        "summary": dict(csv=descriptor("file-sha256-v1", f"{accession}_files.csv", "csv_changed"),
+        "summary": dict(csv=descriptor("file-sha256-v1", document_path(output, accession, "reports", "csv", f"{accession}_files.csv", status).relative_to(output).as_posix(), "csv_changed"),
                         xml=exact_xml, csv_stylesheet=descriptor("file-sha256-v1", "files.csv.xslt", "csv_stylesheet_changed", "stylesheets"), payload=logical),
         "fixity": dict(inventory=inventory, payload=logical),
         "bag_construct": dict(inventory=inventory, payload=logical),
@@ -572,16 +668,15 @@ def _snapshot(descriptor, output, layout, stylesheets):
         raise ValueError("invalid_evidence_path")
     _no_link(path)
     recorded_method = descriptor["method"]
-    method = LEGACY_METHODS.get(recorded_method, recorded_method)
-    algorithm = "md5" if recorded_method in LEGACY_METHODS else "sha256"
+    method = recorded_method
     functions = {"file-sha256-v1": file_fingerprint, "inventory-sha256-v1": inventory_fingerprint, "fits-sha256-v1": fits_fingerprint,
                  "bag-stat-sha256-v1": bag_stat_fingerprint, "file-stat-v1": file_stat}
     if method == "file-stat-v1":
         digest = file_stat(path)
     elif method == "payload-stat-sha256-v1":
-        digest = payload_stat_fingerprint(path, layout, algorithm)
+        digest = payload_stat_fingerprint(path, layout)
     else:
-        digest = functions[method](path, algorithm) if algorithm == "md5" else functions[method](path)
+        digest = functions[method](path)
     return dict(method=recorded_method, value=digest, path=value, scope=descriptor["scope"])
 
 
@@ -590,9 +685,9 @@ def capture_stage(stage, status, output, accession, input_side, stylesheets=None
     output = Path(output).resolve()
     stylesheets = Path(stylesheets or XSLT_DIR).resolve()
     captured, errors = {}, []
-    specs = _specs(stage, status, accession, input_side, recording=True)
+    specs = _specs(stage, status, accession, input_side, output=output)
     for name, descriptor in specs.items():
-        if stage == "bag_construct" and input_side and name == "inventory" and not (output / f"{accession}.xml").exists():
+        if stage == "bag_construct" and input_side and name == "inventory" and not (output / descriptor["path"]).exists():
             continue  # Construction without an XML baseline is an established API path.
         try:
             captured[name] = _snapshot(descriptor, output, status["layout"], stylesheets)
@@ -636,7 +731,7 @@ def reconcile_status(status, output, accession, stylesheets=None):
                 record["freshness"].update(state="unverified", method=METHOD, reasons=["missing_evidence"])
             continue  # Pre-fingerprint history is not retrospectively verified.
         for side in ("inputs", "evidence"):
-            specs = _specs(stage, candidate, accession, side == "inputs")
+            specs = _specs(stage, candidate, accession, side == "inputs", output=output)
             if stage == "bag_construct" and "inventory" not in record["inputs"]:
                 specs.pop("inventory", None)
             for name, descriptor in specs.items():
@@ -644,29 +739,15 @@ def reconcile_status(status, output, accession, stylesheets=None):
                 if not isinstance(previous, dict) or not {"method", "value", "path", "scope"} <= previous.keys():
                     unknown.append("missing_evidence")
                     continue
-                legacy = LEGACY_METHODS.get(previous.get("method")) == descriptor["method"]
-                if previous.get("method") != descriptor["method"] and not legacy:
+                if previous.get("method") != descriptor["method"]:
                     unknown.append("unsupported_evidence_method")
                     continue
                 try:
-                    if legacy:
-                        # Verify the old baseline first. Never rebase changed evidence.
-                        old = _snapshot(dict(descriptor, method=previous["method"]),
-                                        output, candidate["layout"], stylesheets)
-                        if previous != old:
-                            stale.append(descriptor["reason"])
-                            continue
                     key = (descriptor["method"], descriptor["scope"], descriptor["path"])
                     if key not in cache:
                         cache[key] = _snapshot(descriptor, output, candidate["layout"], stylesheets)
                     current = cache[key]
-                    if legacy:
-                        if _snapshot(dict(descriptor, method=previous["method"]),
-                                     output, candidate["layout"], stylesheets) != previous:
-                            stale.append(descriptor["reason"])
-                            continue
-                        record[side][name] = current
-                    elif previous != current:
+                    if previous != current:
                         stale.append(descriptor["reason"])
                 except FileNotFoundError:
                     stale.append("missing_output" if side == "evidence" else "missing_input")
@@ -746,14 +827,14 @@ def now():
 
 class RunRecorder:
     """One serialized managed run. Never consult stage states to skip work."""
-    def __init__(self, output, accession):
+    def __init__(self, output, accession, collection_name=None):
         self.output = Path(output).resolve()
         self.accession = accession
         try:
             self.status = load_status(self.output, accession)
         except FileNotFoundError:
-            # Existing artifacts do not establish layout or legacy execution history.
-            self.status = create_status(self.output, accession, layout="unknown")
+            # Existing artifacts do not establish layout or execution history.
+            self.status = create_status(self.output, accession, layout="unknown", collection_name=collection_name)
 
     def paths(self, **paths):
         """Record only actual artifacts, relative to the output root."""
@@ -793,7 +874,7 @@ class RunRecorder:
                 message=str(operation_error)[:2000], result=deepcopy(progress or {}))
             if stage == "reports" and (progress or {}).get("csv_generated"):
                 candidate["steps"][stage]["outcome"] = "partial"
-                candidate["steps"][stage]["outputs"] = self.paths(csv=self.output / f"{self.accession}_files.csv")
+                candidate["steps"][stage]["outputs"] = self.paths(csv=progress.get("csv_path") or document_path(self.output, self.accession, "reports", "csv", f"{self.accession}_files.csv"))
             if stage == "bag_construct":
                 candidate["layout"] = "unknown"  # Rejected/partial construction is not a verified layout.
             try:
@@ -883,7 +964,9 @@ def artifact_availability(output, accession, status=None):
     """No hashing, timestamps, XML parsing, or writes. Reject escaping recorded paths."""
     root = Path(output).resolve()
     _status_path(root, accession)  # Shared accession-component safety rules.
-    payload = root / accession
+    payload = collection_directory(root, accession)
+    xml = document_path(root, accession, "ingest", "xml", f"{accession}.xml", status)
+    csv = document_path(root, accession, "reports", "csv", f"{accession}_files.csv", status)
     layout = bag_layout(payload)
     recorded = {}
     requirements = {
@@ -905,14 +988,14 @@ def artifact_availability(output, accession, status=None):
             if not path.resolve().is_relative_to(root) or not (path.is_dir() if kind == "dir" else path.is_file()):
                 valid = False
                 break
-            expected = {("ingest", "payload"): payload, ("ingest", "xml"): root / f"{accession}.xml",
-                        ("fits", "xml"): root / f"{accession}.xml", ("bag_construct", "bag"): payload}.get((stage, name))
+            expected = {("ingest", "payload"): payload, ("ingest", "xml"): xml,
+                        ("fits", "xml"): xml, ("bag_construct", "bag"): payload}.get((stage, name))
             if expected is not None and path.resolve() != expected.resolve():
                 valid = False
                 break
         recorded[stage] = valid
-    return dict(payload=payload.is_dir(), xml=(root / f"{accession}.xml").is_file(),
-                csv=(root / f"{accession}_files.csv").is_file(), layout=layout,
+    return dict(payload=payload.is_dir(), xml=xml.is_file(),
+                csv=csv.is_file(), layout=layout,
                 bag=layout == "bagged", bag_profile="aptrust" if (payload / "aptrust-info.txt").is_file() else "generic",
                 recorded=recorded)
 
