@@ -2,9 +2,9 @@
 
 Automation for Data Accessioner, FITS, XSLTProcessor, hashlib, Microsoft Defender, and DART.
 
-## Installation
+[Installation](install/INSTALLATION.md) · [How to Use](HOW_TO_USE.md) · [Developer Options](DEVELOPER_OPTIONS.md)
 
-See [Installation](install/INSTALLATION.md) to install dependencies and run the application.
+---
 
 ## Data Accessioner
 - Transfers files from disks onto a file server
@@ -31,6 +31,20 @@ See [Installation](install/INSTALLATION.md) to install dependencies and run the 
 - How the function works:
     - Transforms the XML report into CSV and HTML reports
     - Includes file metadata and checksums
+
+**Metadata Output Fields**
+
+The CSV report contains one row per file with the following information:
+
+| Field                                           | Description                                       |
+| ----------------------------------------------- | ------------------------------------------------- |
+| `directory path`, `file name`, `file extension` | File location, name, and extension.               |
+| `last modified`, `size (bytes)`                 | Last modified date and file size.                 |
+| `SHA-256`, `MD5`                                | Checksums used to verify file integrity.          |
+| `file format`, `format version`                 | File format and version identified by FITS.       |
+| `format registry key/PUID`, `MIME Type`         | Standard identifiers describing file formats.     |
+| `Identified By`, `ID Warning`                   | Format identification tool and recorded warnings. |
+
 - Sample output
     - CSV:
       <img width="1780" height="193" alt="image" src="https://github.com/user-attachments/assets/77c7f8d0-6a58-4055-b66a-3265235e2fa6" />
@@ -53,7 +67,10 @@ See [Installation](install/INSTALLATION.md) to install dependencies and run the 
       <img width="1702" height="447" alt="image" src="https://github.com/user-attachments/assets/84d3776e-263b-4120-8636-235ba5fe3c7a" />
 
 ## Virus scanning
-- Uses Microsoft Defender for an optional antivirus scan before ingest.
+
+- Uses Microsoft Defender on Windows for an optional antivirus scan before ingest.
+- If Microsoft Defender is unavailable, processing can continue without antivirus scanning.
+- Other antivirus scanners are not currently supported. See [Developer Options](DEVELOPER_OPTIONS.md) for instructions on integrating a different antivirus scanner.
 
 ## Bagging function (optional)
 - Packages files and metadata using BagIt with SHA-256 manifests and tag manifests.
@@ -63,3 +80,9 @@ See [Installation](install/INSTALLATION.md) to install dependencies and run the 
 ## Resume / Status
 - Processing steps can be selected and run separately.
 - The pipeline keeps a status file so users can return later and continue unfinished processing.
+
+## Contributors
+
+- **Quinn Hamilton** — Started the project.
+- **Will Palma** — Contributed to project development.
+- **Bilal Baig** — Contributed to project development.

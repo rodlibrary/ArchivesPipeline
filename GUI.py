@@ -6,6 +6,7 @@ import logging
 import traceback
 import re
 import json
+import csv
 import os
 import tempfile
 from datetime import datetime
@@ -14,9 +15,11 @@ from pipeline_state import RunRecorder, file_count, fixity_result
 import pipeline_state as pipeline_status
 from pipeline_state import summarize_user_steps, format_stage_details
 from pipeline_state import build_resume_plan, bag_layout, resolve_payload_root
-from pipeline_state import load_reconciled_status
+from pipeline_state import load_reconciled_status, document_path, is_managed_documentation, collection_directory
 
 from pipeline import (
+    documentation_dir,
+    new_document,
     ingest_accession,
     stored_checksum,
     enrich_accession_with_fits,
@@ -199,9 +202,9 @@ def validate_selected_run(options, allow_no_steps=False):
              *(f"LPT{i}" for i in range(1, 10))}):
         raise ValueError("Accession Number must be a single safe path component.")
     output = Path(options["output"]).resolve()
-    payload = output / accession
-    xml = output / f"{accession}.xml"
-    if payload.resolve().parent != output or xml.resolve().parent != output:
+    payload = collection_directory(output, accession)
+    xml = document_path(output, accession, "ingest", "xml", f"{accession}.xml")
+    if not payload.resolve().is_relative_to(output) or not xml.resolve().is_relative_to(output):
         raise ValueError("Accession paths must stay inside Output Directory.")
     if output.exists() and not output.is_dir():
         raise ValueError("Output Directory must be a directory.")
@@ -294,21 +297,18 @@ def select_remaining_steps(status):
         variable.set(not all(status["steps"][stage]["state"] == "completed" and
                              status["steps"][stage]["freshness"]["state"] == "current"
                              for stage in stages))
+    if status["steps"]["ingest"]["state"] == "completed":
+        run_ingest.set(False)  # Existing accessions must not be ingested again.
     # Stage history alone does not establish which optional bag operations were requested.
     run_bagging.set(False)
 
 
 def stale_completed_warning(status):
     """Group completed work affected by changes into the five user-facing steps."""
-    groups = (
-        ("Step 1 — Ingest", ("antivirus", "ingest")),
-        ("Step 2 — Format Identification", ("fits",)),
-        ("Step 3 — Reports", ("reports", "summary")),
-        ("Step 4 — Fixity", ("fixity",)),
-        ("Step 5 — Bagging", ("bag_construct", "bag_validate", "tar_serialize")),
-    )
+    groups = [(label, stages) for _, label, stages in processing_groups()]
     affected = [heading for heading, stages in groups
-                if any(status["steps"][stage]["state"] == "completed" and
+                if any(not (stage == "ingest" and ingest_changes_processed(status)) and
+                       status["steps"][stage]["state"] == "completed" and
                        status["steps"][stage]["freshness"]["state"] == "stale"
                        for stage in stages)]
     if not affected:
@@ -412,8 +412,19 @@ def show_status_details():
     scroll = ttk.Scrollbar(details_window, command=text.yview)
     text.configure(yscrollcommand=scroll.set)
     scroll.pack(side="right", fill="y")
+    options = dict(output=output_dir_var.get(), accession=loaded_history["accession_number"],
+                   _status_snapshot=loaded_history)
+    if loaded_history["steps"]["fixity"]["outcome"] == "findings":
+        ttk.Button(details_window, text="View Affected Files",
+                   command=lambda: show_processing_details(details_window, options, [], "affected")).pack(side="bottom")
+    if loaded_history["steps"]["fixity"]["outputs"].get("log"):
+        ttk.Button(details_window, text="View fixity LOG",
+                   command=lambda: show_processing_details(details_window, options, [], "log")).pack(side="bottom")
     text.pack(side="left", fill="both", expand=True)
     text.insert("1.0", format_stage_details(loaded_history))
+    findings = fixity_findings_message(loaded_history, options["output"])
+    if findings:
+        text.insert("end", "\n\n" + findings)
     text.configure(state="disabled")
 
 
@@ -471,13 +482,7 @@ def prepare_execution_plan(options):
 
 def format_run_confirmation(plan, options):
     """Describe planned work for users without changing any decisions."""
-    groups = (
-        ("Step 1 — Ingest", ("antivirus", "ingest")),
-        ("Step 2 — Format Identification", ("fits",)),
-        ("Step 3 — Reports", ("reports", "summary")),
-        ("Step 4 — Fixity", ("fixity",)),
-        ("Step 5 — Bagging", ("bag_construct", "bag_validate", "tar_serialize")),
-    )
+    groups = [(label, stages) for _, label, stages in processing_groups()]
     by_stage = {item["stage"]: item for item in plan}
     unbagged = {item["stage"] for item in plan if item["reason"] == "unbagged_payload_required"}
     dependent_reports = ("fits" in unbagged and by_stage["reports"]["reason"] == "fits_requires_review")
@@ -513,7 +518,7 @@ def format_run_confirmation(plan, options):
         "existing_preservation_baseline": "An accession inventory already exists; review it before ingesting again.",
         "scan_cannot_be_reused_for_new_ingest": "A new ingest needs a new virus scan.",
         "successful_validation_required": "The BagIt package must pass validation before creating a TAR archive.",
-        "managed_fixity_findings_require_passing_rerun": "Fixity found missing or changed files; rerun Fixity and obtain a passing result before bagging.",
+        "managed_fixity_findings_require_passing_rerun": "Resolve the file integrity issues documented in the fixity report, then verify successfully before packaging.",
         "completed_outputs_missing": "Previously completed outputs are missing and will be recreated.",
         "explicit_safe_rerun": "Previously completed work will run again as requested.",
         "failed": "The previous attempt failed; this work will be retried.",
@@ -529,6 +534,8 @@ def format_run_confirmation(plan, options):
             if len(stages) > 1:
                 lines.extend(f"  • {labels[item['stage']]}" for item in running)
         for item in entries:
+            if item["action"] not in ("review", "block"):
+                continue
             if item["reason"] == "not_requested" or item["stage"] in grouped_warnings:
                 continue
             reason = item["reason"]
@@ -558,7 +565,7 @@ def format_run_confirmation(plan, options):
                  "The following selected processing requires an unbagged working accession:", ""]
         lines.extend(f"• {heading}" for heading, stages in groups if unbagged.intersection(stages))
         if dependent_reports:
-            lines.extend(["", "Step 3 — Reports cannot proceed because Step 2 — Format Identification is also selected and cannot proceed."])
+            lines.extend(["", f"{processing_groups()[2][1]} cannot proceed because {processing_groups()[1][1]} is also selected and cannot proceed."])
         lines.extend(["", "To reprocess these steps, use an unbagged working copy of the accession.", "",
                       "Reports can still be regenerated separately from the saved metadata when their blocked dependencies are not selected."])
     elif blocked:
@@ -567,9 +574,18 @@ def format_run_confirmation(plan, options):
         lines = ["No steps need to run."]
     elif not any(item["action"] == "run" for item in plan):
         lines = ["No processing steps are selected to run."]
-    if not blocked and any(item["action"] == "reuse" for item in plan):
+    previous_steps = (options.get("_status_snapshot") or {}).get("steps", {})
+    rerunning_completed = any(
+        item["action"] == "run" and (
+            previous_steps.get(item["stage"], {}).get("state") == "completed"
+            or item["reason"] in ("explicit_safe_rerun", "completed_outputs_missing")
+        ) for item in plan
+    )
+    if not blocked and rerunning_completed:
+        lines.extend(["", "Previously completed selected steps will run again. All other steps will be skipped."])
+    elif not blocked and any(item["action"] == "reuse" for item in plan):
         lines.extend(["", "Previously completed steps will be reused automatically."])
-    if not blocked and any(all(by_stage[s]["reason"] == "not_requested" for s in stages) for _, stages in groups):
+    if not blocked and not rerunning_completed and any(all(by_stage[s]["reason"] == "not_requested" for s in stages) for _, stages in groups):
         lines.extend(["", "Other steps will not run."])
     if attention:
         lines.extend(["", "Please note:", *dict.fromkeys(attention)])
@@ -578,12 +594,204 @@ def format_run_confirmation(plan, options):
 
 def processing_groups():
     return (
-        ("ingest", "Step 1 - Ingest", ("antivirus", "ingest")),
-        ("fits", "Step 2 - Format Identification", ("fits",)),
-        ("reports", "Step 3 - Reports", ("reports", "summary")),
-        ("fixity", "Step 4 - Fixity", ("fixity",)),
-        ("bagging", "Step 5 - Bagging", ("bag_construct", "bag_validate", "tar_serialize")),
+        ("ingest", "Step 1 — Ingest (Data Accessioner)", ("antivirus", "ingest")),
+        ("fits", "Step 2 — Identify File Formats", ("fits",)),
+        ("reports", "Step 3 — Generate Metadata Reports", ("reports", "summary")),
+        ("fixity", "Step 4 — Verify File Integrity", ("fixity",)),
+        ("bagging", ("Step 5 — BagIt Packaging (optional)" if BAGIT_AVAILABLE else
+                     "Step 5 — BagIt Packaging (optional; install bagit-python to enable)"), ("bag_construct", "bag_validate", "tar_serialize")),
     )
+
+
+def ingest_change_explanation():
+    return (processing_groups()[0][1] +
+            " has outdated recorded results, but ingest will not run again because the accession "
+            "has already been created. Review the existing accession files; safe downstream "
+            "steps can be rerun without copying or moving the source again.")
+
+
+def ingest_changes_processed(status):
+    """Recognize historical ingest differences covered by current downstream evidence.
+
+    Do not update ingest history or accept unknown/settings changes. A current
+    fixity result can still contain findings; the packaging gate handles those.
+    """
+    if not status:
+        return False
+    ingest = status["steps"]["ingest"]
+    reasons = set(ingest["freshness"]["reasons"])
+    if (ingest["state"] != "completed" or not reasons or
+            not reasons <= {"payload_changed", "baseline_inventory_changed", "checksum_workflow_changed"}):
+        return False
+    for stage, lineage in (("fits", ("inventory", "payload")),
+                           ("reports", ("xml", "payload")),
+                           ("summary", ("xml", "payload")),
+                           ("fixity", ("inventory", "payload"))):
+        record = status["steps"][stage]
+        if (record["state"] != "completed" or record["freshness"]["state"] != "current"
+                or not all(key in record["inputs"] for key in lineage)):
+            return False
+    return True
+
+
+def current_fixity_findings(status):
+    record = (status or {}).get("steps", {}).get("fixity", {})
+    return (record.get("state") == "completed" and record.get("outcome") == "findings"
+            and record.get("freshness", {}).get("state") == "current")
+
+
+FIXITY_STATUS_LABELS = {
+    "MISMATCH": "Checksum Mismatch", "MISSING": "Missing File", "ERROR": "Verification Error",
+}
+
+
+def read_fixity_findings(status, output):
+    """Read failed rows from the recorded CSV; never infer findings from logs."""
+    try:
+        accession = status["accession_number"]
+        if not status["steps"]["fixity"]["outputs"].get("csv"):
+            raise ValueError("No CSV report was recorded.")
+        path = document_path(output, accession, "fixity", "csv", f"fixity_{accession}.csv", status)
+        with path.open(encoding="utf-8-sig", newline="") as stream:
+            reader = csv.DictReader(stream)
+            if not {"file_path", "status"} <= set(reader.fieldnames or []):
+                raise ValueError("The report is missing its file path or status column.")
+            failed = []
+            for row in reader:
+                if row.get("status") not in {"OK", *FIXITY_STATUS_LABELS}:
+                    raise ValueError("The report contains an unrecognized verification status.")
+                if row["status"] in FIXITY_STATUS_LABELS:
+                    failed.append(row)
+        return failed, ""
+    except (OSError, ValueError, KeyError, TypeError, csv.Error) as exc:
+        return [], f"Affected files could not be loaded from the fixity CSV: {exc}"
+
+
+def affected_files_text(status, output):
+    rows, error = read_fixity_findings(status, output)
+    if error:
+        return error + "\nThe recorded integrity findings remain unresolved. Review the existing reports."
+    if not rows:
+        return "No failed entries were found in this report. The recorded findings still require review."
+    lines = [f"{len(rows)} file{'s' if len(rows) != 1 else ''} failed integrity verification."]
+    for row in rows:
+        lines.extend(["", f"{Path(row['file_path']).name} — {FIXITY_STATUS_LABELS[row['status']]}",
+                      f"Full path: {row['file_path']}"])
+    return "\n".join(lines)
+
+
+def fixity_findings_message(status, output):
+    record = (status or {}).get("steps", {}).get("fixity", {})
+    if record.get("outcome") != "findings":
+        return ""
+    lines = ["Verification completed with file integrity issues."]
+    rows, error = read_fixity_findings(status, output)
+    if error:
+        lines.append(error)
+        counts = record.get("result", {})
+        lines.append("Recorded counts: " + "; ".join(
+            f"{label}: {counts.get(key, 'unavailable')}" for label, key in
+            (("Mismatches", "mismatch_count"), ("Missing", "missing_count"), ("Errors", "error_count"))))
+    elif rows:
+        lines.append(f"{len(rows)} file{'s' if len(rows) != 1 else ''} failed integrity verification.\n\nAffected files:")
+        lines.extend(f"• {Path(row['file_path']).name} — {FIXITY_STATUS_LABELS[row['status']]}" for row in rows[:5])
+        if len(rows) > 5:
+            lines.append(f"And {len(rows) - 5} more. Use View Affected Files for the complete list.")
+    else:
+        lines.append("The CSV contains no failed entries; the recorded findings still require review.")
+    lines.extend(["", "A checksum mismatch means the computed checksum differs from the original recorded "
+                  "checksum; it does not establish why the file changed. A missing file could not be found. "
+                  "A verification error means the check could not be completed.",
+                  "", "BagIt packaging cannot continue until these discrepancies are resolved.",
+                  "", "Accidental change: Restore the exact original file from a trusted source, then rerun " +
+                  processing_groups()[3][1] + ". Use Rerun completed selected steps if needed.",
+                  "", "Intentional change: Create a separate accession/package version with its own inventory "
+                  "and checksums, preserving the original accession and preservation package.",
+                  "", "Rerunning verification without correcting the discrepancy will not resolve a checksum mismatch."])
+    return "\n".join(lines)
+
+
+def format_processing_changes(options, plan):
+    """Present existing planner reasons and recorded context without rescanning files."""
+    snapshot = options.get("_status_snapshot") or {}
+    lines = ["Changes detected by the existing processing-status checks.",
+             "Directory fingerprints do not retain a per-file change list; recorded paths below "
+             "are context, not a list of individually changed files."]
+    for _, label, stages in processing_groups():
+        affected = [item for item in plan if item["stage"] in stages and "freshness_reasons" in item]
+        if not affected:
+            continue
+        lines.extend(["", label])
+        for item in affected:
+            stage = item["stage"]
+            record = snapshot.get("steps", {}).get(stage, {})
+            lines.append(f"  {pipeline_status.STAGE_NAMES[stage]}")
+            reasons = item.get("freshness_reasons", [])
+            lines.extend("    Reason: " + reason.replace("_", " ") for reason in reasons)
+            if not reasons:
+                lines.append("    No specific change reason was recorded.")
+            lines.append(f"    Planner decision: {item['action']} ({item['reason'].replace('_', ' ')})")
+            paths = set()
+            for side in ("inputs", "evidence"):
+                for descriptor in record.get(side, {}).values():
+                    if isinstance(descriptor, dict) and descriptor.get("path"):
+                        paths.add(f"{descriptor.get('scope', 'output')}: {descriptor['path']}")
+            lines.extend("    Recorded path: " + path for path in sorted(paths))
+            if "settings_changed" in reasons:
+                previous = record.get("inputs", {}).get("settings")
+                current = record.get("settings", {})
+                if isinstance(previous, dict):
+                    for key in sorted(previous.keys() | current.keys()):
+                        if previous.get(key) != current.get(key):
+                            lines.append(f"    Setting {key}: {previous.get(key)!r} -> {current.get(key)!r}")
+                else:
+                    lines.append("    Specific previous setting values are unavailable.")
+            if "checksum_workflow_changed" in reasons:
+                lines.append("    Recorded checksum workflow: " + repr(record.get("settings", {}).get("checksum_workflow")))
+                lines.append("    Required checksum workflow: " + repr(pipeline_status.CHECKSUM_WORKFLOW))
+    if any(item["stage"] == "ingest" and "freshness_reasons" in item for item in plan):
+        lines.extend(["", ingest_change_explanation()])
+    lines.extend(["", "Current processing plan:", format_run_confirmation(plan, options)])
+    findings = fixity_findings_message(snapshot, options["output"])
+    if findings:
+        lines.extend(["", findings])
+    return "\n".join(lines)
+
+
+def show_processing_details(parent, options, plan, report_key=None):
+    """Keep details inside the review dialog's modal lifecycle."""
+    window = tk.Toplevel(parent)
+    window.title("Affected Files" if report_key == "affected" else
+                 f"Fixity {report_key.upper()} Report" if report_key else "Processing Change Details")
+    window.transient(parent)
+    text = tk.Text(window, width=90, height=28, wrap="word")
+    scroll = ttk.Scrollbar(window, command=text.yview)
+    text.configure(yscrollcommand=scroll.set)
+    scroll.pack(side="right", fill="y")
+    ttk.Button(window, text="Close", command=window.destroy).pack(side="bottom")
+    text.pack(fill="both", expand=True)
+    if report_key is None:
+        content = format_processing_changes(options, plan)
+    elif report_key == "affected":
+        content = affected_files_text(options.get("_status_snapshot"), options["output"])
+    else:
+        try:
+            path = document_path(options["output"], options["accession"], "fixity", report_key,
+                                 f"fixity_{options['accession']}.{report_key}", options.get("_status_snapshot"))
+            content = str(path) + "\n\n" + path.read_text(encoding="utf-8")
+        except (OSError, ValueError) as exc:
+            content = f"The fixity report could not be read: {exc}"
+    text.insert("1.0", content)
+    text.configure(state="disabled")
+    ttk.Button(window, text="Copy Text", command=lambda: (
+        window.clipboard_clear(), window.clipboard_append(content))).pack(side="bottom")
+    window.bind("<Escape>", lambda event: window.destroy())
+    window.grab_set()
+    window.focus_set()
+    parent.wait_window(window)
+    if parent.winfo_exists():
+        parent.grab_set()
+        parent.focus_set()
 
 
 def stale_bagging_steps(options, plan):
@@ -628,6 +836,9 @@ def propose_rerun(options, plan):
     targets = {item["stage"] for item in plan if "freshness_reasons" in item
                and item["stage"] in ("fits", "reports", "summary", "fixity")}
     targets.update(item["stage"] for item in plan if item["action"] in ("review", "block"))
+    findings_current = current_fixity_findings(options.get("_status_snapshot"))
+    if findings_current:
+        targets.discard("fixity")
     manual = set()
     selected = set()
     for _ in range(len(pipeline_status.STAGE_IDS)):
@@ -651,6 +862,8 @@ def propose_rerun(options, plan):
                     upstream.add(stage)
             if reason in ("managed_fixity_findings_require_passing_rerun", "successful_validation_required"):
                 upstream.add("fixity" if reason.startswith("managed") else "bag_validate")
+        if findings_current:
+            upstream.discard("fixity")
         if upstream.issubset(targets):
             break
         targets.update(upstream)
@@ -680,7 +893,7 @@ def review_rerun_steps(options, plan):
     if (snapshot and snapshot["steps"]["ingest"]["state"] == "completed"
             and snapshot["steps"]["ingest"]["freshness"]["state"] == "stale"
             and not proposed["steps"]["ingest"]):
-        message += "\n\nStep 1 - Ingest will not run again because the accession has already been created."
+        message += "\n\n" + ingest_change_explanation()
     message += "\n\nSteps to rerun:\n" + "\n".join(names)
     if bag_layout(Path(options["output"]) / options["accession"]) == "bagged":
         message += ("\n\nFiles in this packaged accession have changed. Reprocessing can update format, "
@@ -703,6 +916,18 @@ def processing_review_dialog(title, message, options, plan, *, allow_continue=Fa
     dialog.title(title)
     dialog.transient(root)
     choice = "cancel"
+    if current_fixity_findings(options.get("_status_snapshot")):
+        if title == "Processing Cannot Start":
+            dialog.title("File Integrity Issue Detected")
+            message = fixity_findings_message(options["_status_snapshot"], options["output"])
+        else:
+            message += "\n\n" + fixity_findings_message(options["_status_snapshot"], options["output"])
+        # A manual selection remains executable; recommendations must not imply
+        # that repeating an unchanged verification resolves preservation findings.
+        allow_review = allow_review and any(
+            item["stage"] in ("fits", "reports", "summary") and
+            ("freshness_reasons" in item or item["action"] in ("review", "block"))
+            for item in plan)
 
     def finish(value):
         nonlocal choice
@@ -714,7 +939,14 @@ def processing_review_dialog(title, message, options, plan, *, allow_continue=Fa
     ttk.Label(frame, text=message, wraplength=520, justify="left").pack(anchor="w")
     buttons = ttk.Frame(frame)
     buttons.pack(anchor="e", pady=(16, 0))
-    ttk.Button(buttons, text="View Details", command=show_error_details).pack(side="left", padx=4)
+    ttk.Button(buttons, text="View Details", command=lambda: show_processing_details(dialog, options, plan)).pack(side="left", padx=4)
+    record = (options.get("_status_snapshot") or {}).get("steps", {}).get("fixity", {})
+    if record.get("outcome") == "findings":
+        ttk.Button(buttons, text="View Affected Files",
+                   command=lambda: show_processing_details(dialog, options, plan, "affected")).pack(side="left", padx=4)
+    if record.get("outputs", {}).get("log"):
+        ttk.Button(buttons, text="View LOG",
+                   command=lambda: show_processing_details(dialog, options, plan, "log")).pack(side="left", padx=4)
     if allow_review:
         ttk.Button(buttons, text="Rerun Steps", command=lambda: finish("review")).pack(side="left", padx=4)
     if allow_continue:
@@ -779,8 +1011,8 @@ def run_pipeline(options=None, plan=None):
     steps = options["steps"]
     out_dir = Path(options["output"])
     accession = options["accession"]
-    payload = out_dir / accession
-    xml = out_dir / f"{accession}.xml"
+    payload = None
+    xml = None
     log_path = None
     current_step = "Preparing processing (before processing starts)"
 
@@ -801,8 +1033,9 @@ def run_pipeline(options=None, plan=None):
         actions = {item["stage"]: item["action"] for item in plan}
         should_run = lambda stage: actions[stage] == "run"
         out_dir.mkdir(parents=True, exist_ok=True)
+        documentation_dir(out_dir, accession)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_path = out_dir / f"pipeline_log_{accession}_{timestamp}.log"
+        log_path = new_document(out_dir, f"pipeline_log_{accession}_{timestamp}.log", accession)
         current_step = "Initializing processing log (before processing starts)"
         for handler in logging.root.handlers[:]:
             logging.root.removeHandler(handler)
@@ -810,7 +1043,9 @@ def run_pipeline(options=None, plan=None):
                             format="%(asctime)s - %(levelname)s - %(message)s", filemode="w",
                             encoding="utf-8")
         current_step = "Initializing accession status (before processing starts)"
-        recorder = RunRecorder(out_dir, accession)
+        recorder = RunRecorder(out_dir, accession, collection_name=Path(options["input"]).name if options.get("input") else None)
+        payload = collection_directory(out_dir, accession)
+        xml = document_path(out_dir, accession, "ingest", "xml", f"{accession}.xml", recorder.status)
         logging.info("Selected processing started: %s", ", ".join(k for k, v in steps.items() if v))
         if should_run("antivirus") or should_run("ingest"):
             clean_files = None
@@ -887,13 +1122,15 @@ def run_pipeline(options=None, plan=None):
             if should_run("reports"):
                 require_accession_xml(xml, accession)
             status_var.set("Generating Reports...")
-            csv = out_dir / f"{accession}_files.csv"
-            html = out_dir / f"{accession}_files.html"
+            csv = (new_document(out_dir, f"{accession}_files.csv", accession) if should_run("reports") else
+                   document_path(out_dir, accession, "reports", "csv", f"{accession}_files.csv"))
+            html = new_document(out_dir, f"{accession}_files.html", accession) if should_run("reports") else None
             report_progress = dict(csv_generated=False, html_generated=False)
 
             def generate_reports():
                 run_xslt_processor(xml, XSLT_DIR / "files.csv.xslt", csv)
                 report_progress["csv_generated"] = True
+                report_progress["csv_path"] = str(csv)
                 run_xslt_processor(xml, XSLT_DIR / "files.html.xslt", html)
                 report_progress["html_generated"] = True
 
@@ -903,7 +1140,7 @@ def run_pipeline(options=None, plan=None):
                                         outputs=recorder.paths(csv=csv, html=html)), progress=report_progress)
             if should_run("summary"):
                 run_stage("summary", lambda: generate_summary_report(csv, out_dir, accession),
-                         lambda _: dict(outcome="generated", outputs=recorder.paths(text=out_dir / f"{accession}.txt")))
+                         lambda path: dict(outcome="generated", outputs=recorder.paths(text=path)))
         if should_run("fixity"):
             current_step = "Fixity"
             payload_root = resolve_payload_root(payload, bag_layout(payload))
@@ -914,7 +1151,7 @@ def run_pipeline(options=None, plan=None):
         if any(should_run(s) for s in ("bag_construct", "bag_validate", "tar_serialize")):
             current_step = "Bagging"
             if recorder.status["steps"]["fixity"]["outcome"] == "findings":
-                raise ValueError("Managed fixity findings block Bagging. Explicitly rerun Fixity and obtain a passing result.")
+                raise ValueError(fixity_findings_message(recorder.status, out_dir))
             if any(item.get("requires_passing_fixity") for item in plan) and recorder.status["steps"]["fixity"]["outcome"] != "passed":
                 raise ValueError("A passing Fixity rerun is required before Bagging.")
             bag_path = payload
@@ -958,11 +1195,14 @@ def run_pipeline(options=None, plan=None):
                     raise ValueError(f"Bag validation failed; TAR serialization blocked: {error}")
             if should_run("tar_serialize"):
                 status_var.set("Serializing TAR...")
-                tar_path = run_stage("tar_serialize", lambda: serialize_bag_to_tar(bag_path),
+                tar_path = run_stage("tar_serialize", lambda: serialize_bag_to_tar(
+                                        bag_path),
                                         lambda path: dict(outcome="serialized", outputs=recorder.paths(tar=path)))
         status_var.set("Selected processing steps completed.")
         logging.info("Selected processing steps completed.")
         summary = ["Selected processing steps completed."]
+        if should_run("fixity") and recorder.status["steps"]["fixity"]["outcome"] == "findings":
+            summary.append(fixity_findings_message(recorder.status, out_dir))
         if infected_files:
             summary.append(f"{len(infected_files)} Defender-flagged file(s) excluded from ingest.")
         if bag_valid is True:
@@ -990,12 +1230,21 @@ def start_pipeline():
         plan = prepare_execution_plan(options)
         stale = [item for item in plan if "freshness_reasons" in item
                  and item["stage"] in ("ingest", "fits", "reports", "summary", "fixity")
+                 and not (item["stage"] == "ingest" and
+                          ingest_changes_processed(options.get("_status_snapshot")))
                  and (item["reason"] != "not_requested" or options["steps"].get("bagging"))]
         if stale:
             summary = ("Earlier processing results may be outdated.\n\nAffected steps:\n" +
                        "\n".join(affected_step_names(stale)))
+            if any(item["stage"] == "ingest" for item in stale):
+                summary += "\n\n" + ingest_change_explanation()
+            rerunnable = any(item["stage"] in pipeline_status.SAFE_RERUN for item in stale)
+            if not rerunnable:
+                summary += ("\n\nNo safe automatic rerun can resolve this ingest history. "
+                            "Use View Details to review the recorded reasons and verify the "
+                            "accession and downstream results. A new ingest requires a separate accession.")
             choice = processing_review_dialog("Processing Results Have Changed", summary,
-                options, plan, allow_continue=False)
+                options, plan, allow_continue=False, allow_review=rerunnable)
             if choice != "review":
                 return
             result = review_rerun_steps(options, plan)
@@ -1069,6 +1318,33 @@ def toggle_bag_fields():
 # GUI SETUP
 # ==========================
 
+def add_step_tooltip(widget, text):
+    """Explain a step on hover without adding height to the form."""
+    popup = None
+
+    def show(_event):
+        nonlocal popup
+        if popup is not None:
+            return
+        popup = tk.Toplevel(widget)
+        popup.wm_overrideredirect(True)
+        popup.wm_geometry(f"+{widget.winfo_rootx() + 20}+{widget.winfo_rooty() + widget.winfo_height()}")
+        tk.Label(popup, text=text, justify="left", wraplength=400,
+                 background="#ffffe0", foreground="black", relief="solid",
+                 borderwidth=1, padx=8, pady=5).pack()
+
+    def hide(_event):
+        nonlocal popup
+        if popup is not None:
+            popup.destroy()
+            popup = None
+
+    widget.bind("<Enter>", show, add="+")
+    widget.bind("<Leave>", hide, add="+")
+    widget.bind("<ButtonPress>", hide, add="+")
+    widget.bind("<Destroy>", hide, add="+")
+
+
 root = tk.Tk()
 root.title("Archival Pipeline")
 root.geometry("700x820")
@@ -1085,7 +1361,7 @@ run_ingest = tk.BooleanVar(value=True)
 run_format_identification = tk.BooleanVar(value=True)
 run_reports = tk.BooleanVar(value=True)
 run_fixity_selected = tk.BooleanVar(value=True)
-run_bagging = tk.BooleanVar(value=True)
+run_bagging = tk.BooleanVar(value=False)
 rerun_completed_var = tk.BooleanVar(value=False)
 inputs_locked = False
 loaded_history = None
@@ -1141,9 +1417,9 @@ ent_accession.grid(row=2, column=1, sticky="w", **pad)
 
 # ---- Five user-facing processing steps ----
 steps_frame = tk.LabelFrame(root, text="Processing Steps", padx=8, pady=4)
-steps_frame.grid(row=3, column=0, columnspan=3, sticky="ew", padx=10, pady=3)
+steps_frame.grid(row=3, column=0, columnspan=4, sticky="ew", padx=10, pady=3)
 steps_frame.columnconfigure(1, weight=1)
-chk_ingest = tk.Checkbutton(steps_frame, text="Step 1 — Ingest", variable=run_ingest)
+chk_ingest = tk.Checkbutton(steps_frame, text=processing_groups()[0][1], variable=run_ingest)
 chk_ingest.grid(row=0, column=0, sticky="w")
 av_frame = tk.Frame(steps_frame)
 av_frame.grid(row=1, column=0, columnspan=2, sticky="w", padx=22)
@@ -1164,17 +1440,16 @@ tk.Label(av_frame, textvariable=av_status_var, fg="gray",
 chk_move = tk.Checkbutton(av_frame, text="Move files instead of copy", variable=move_var)
 chk_move.grid(row=2, column=0, sticky="w")
 
-chk_format = tk.Checkbutton(steps_frame, text="Step 2 — Format Identification",
+chk_format = tk.Checkbutton(steps_frame, text=processing_groups()[1][1],
                             variable=run_format_identification)
 chk_format.grid(row=2, column=0, sticky="w")
-chk_reports = tk.Checkbutton(steps_frame, text="Step 3 — Reports", variable=run_reports)
+chk_reports = tk.Checkbutton(steps_frame, text=processing_groups()[2][1], variable=run_reports)
 chk_reports.grid(row=3, column=0, sticky="w")
-chk_fixity = tk.Checkbutton(steps_frame, text="Step 4 — Fixity", variable=run_fixity_selected)
+chk_fixity = tk.Checkbutton(steps_frame, text=processing_groups()[3][1], variable=run_fixity_selected)
 chk_fixity.grid(row=4, column=0, sticky="w")
 
 # BagIt checkbox
-bag_label = ("Step 5 — Bagging (optional)" if BAGIT_AVAILABLE
-             else "Step 5 — Bagging (install bagit-python to enable)")
+bag_label = processing_groups()[4][1]
 chk_bag = tk.Checkbutton(steps_frame, text=bag_label, variable=run_bagging,
                          state="normal" if BAGIT_AVAILABLE else "disabled")
 chk_bag.grid(row=5, column=0, sticky="w")
@@ -1183,6 +1458,17 @@ for row, name in ((0, "ingest"), (2, "format_identification"), (3, "reports"),
     tk.Label(steps_frame, textvariable=step_history_vars[name], anchor="w",
              justify="left", wraplength=300, fg="gray", font=("TkDefaultFont", 8)).grid(
         row=row, column=1, sticky="w", padx=(8, 0))
+
+# Hover descriptions keep the step controls compact.
+for widget, explanation in (
+    (chk_ingest, "Copies or moves collection files, preserves directory structure, and generates accession metadata. "
+                 "Optional Microsoft Defender scanning generates antivirus reports."),
+    (chk_format, "Identifies file formats and associated technical information using FITS with a DROID-focused configuration."),
+    (chk_reports, "Converts accession metadata into CSV and HTML reports for easier review, and creates a TXT summary."),
+    (chk_fixity, "Verifies file checksums and generates CSV and LOG reports documenting the results."),
+    (chk_bag, "Creates a standardized BagIt preservation package for storage or transfer."),
+):
+    add_step_tooltip(widget, explanation)
 
 # ---- BagIt metadata frame ----
 bag_frame = tk.LabelFrame(steps_frame, text="BagIt Metadata", padx=8, pady=4)
